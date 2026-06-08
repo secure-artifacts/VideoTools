@@ -820,6 +820,138 @@ class IrregularSegmentsDialog(QDialog):
     def get_segments(self) -> list[int]:
         return list(self._segments)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  LoopModeDialog — 循环模式配置
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LoopModeDialog(QDialog):
+    """Let the user specify how many times each video (in order) should loop.
+    Each line maps to one input video by position. If there are more lines than
+    files the excess lines are silently ignored; if there are fewer lines the
+    remaining files are skipped."""
+
+    def __init__(self, current_loops: list = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("循环模式 — 配置每个视频的循环次数")
+        self.setMinimumSize(440, 500)
+        self.resize(480, 540)
+        self._loops: list[int] = []
+        self._setup_ui(current_loops or [])
+        self._parse()
+
+    def _setup_ui(self, current_loops: list):
+        self.setStyleSheet("""
+            QDialog { background-color: #1a1d27; color: #d1d5db;
+                      font-family: \"Microsoft YaHei\", \"Segoe UI\"; }
+            QLabel   { color: #d1d5db; }
+            QLabel#Hint { color: #6b7280; font-size: 9pt; }
+            QLabel#Summary { font-size: 10pt; padding: 6px 10px;
+                             border-radius: 6px; background: #1e2535; }
+            QPlainTextEdit { background: #0f1117; border: 1px solid #374151;
+                             border-radius: 6px; color: #e5e7eb;
+                             font-size: 11pt; padding: 8px; }
+            QPlainTextEdit:focus { border-color: #f43f5e; }
+            QPushButton#BtnOK { background: #f43f5e; color: white; border: none;
+                                border-radius: 7px; padding: 9px 24px;
+                                font-size: 11pt; font-weight: bold; }
+            QPushButton#BtnOK:hover { background: #e11d48; }
+            QPushButton#BtnCancelD { background: #1f2937; color: #9ca3af;
+                                    border: 1px solid #374151; border-radius: 7px;
+                                    padding: 9px 20px; font-size: 11pt; }
+            QPushButton#BtnCancelD:hover { background: #374151; color: white; }
+        """)
+        lo = QVBoxLayout(self)
+        lo.setContentsMargins(20, 20, 20, 20)
+        lo.setSpacing(12)
+
+        title = QLabel("🔁  循环模式")
+        title.setStyleSheet("font-size: 14pt; font-weight: bold; color: #ffffff;")
+        lo.addWidget(title)
+
+        hint = QLabel(
+            "每行输入一个数字，代表对应顺序的视频素材循环几次。\n"
+            "第 1 行 → 第 1 个文件，第 2 行 → 第 2 个文件，依此类推。\n"
+            "若行数超过文件数，多余行自动忽略；若行数少于文件数，多余文件跳过。\n"
+            "支持直接从 Excel / WPS 表格复制粘贴（每格一行）。"
+        )
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
+        lo.addWidget(hint)
+
+        self.text_edit = QPlainTextEdit()
+        self.text_edit.setPlaceholderText(
+            "例如：\n3\n5\n2\n\n"
+            "→ 第1个视频循环3次、第2个循环5次、第3个循环2次\n"
+            "   合计输出 3 个独立视频（每个视频是单素材的多次循环合并）"
+        )
+        if current_loops:
+            self.text_edit.setPlainText("\n".join(str(n) for n in current_loops))
+        self.text_edit.textChanged.connect(self._parse)
+        lo.addWidget(self.text_edit, 1)
+
+        self.lbl_summary = QLabel("📊 暂未输入")
+        self.lbl_summary.setObjectName("Summary")
+        self.lbl_summary.setWordWrap(True)
+        lo.addWidget(self.lbl_summary)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_cancel = QPushButton("取 消")
+        btn_cancel.setObjectName("BtnCancelD")
+        btn_cancel.clicked.connect(self.reject)
+        btn_ok = QPushButton("✓  确 认")
+        btn_ok.setObjectName("BtnOK")
+        btn_ok.clicked.connect(self._accept)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_ok)
+        lo.addLayout(btn_row)
+
+    def _parse(self):
+        loops, errors = [], []
+        for i, raw in enumerate(self.text_edit.toPlainText().splitlines(), 1):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                n = int(line)
+                if n < 1:
+                    errors.append(f"第{i}行: 必须 ≥ 1")
+                else:
+                    loops.append(n)
+            except ValueError:
+                errors.append(f"第{i}行: 非数字 '{line}'")
+        if errors:
+            self.lbl_summary.setText("⚠ 错误: " + "  |  ".join(errors[:3]))
+            self.lbl_summary.setStyleSheet("color: #f43f5e; background: #2d1520;")
+            self._loops = []
+        elif loops:
+            total_clips = sum(loops)
+            preview = ", ".join(str(n) for n in loops[:10])
+            if len(loops) > 10:
+                preview += "..."
+            self.lbl_summary.setText(
+                f"✅  共 {len(loops)} 个视频，总片段数 {total_clips}    [{preview}]"
+            )
+            self.lbl_summary.setStyleSheet("color: #10b981; background: #0d2a1f;")
+            self._loops = loops
+        else:
+            self.lbl_summary.setText("📊 暂未输入")
+            self.lbl_summary.setStyleSheet("")
+            self._loops = []
+
+    def _accept(self):
+        self._parse()
+        if not self._loops:
+            QMessageBox.warning(self, "提示", "请至少输入一个有效的循环次数。")
+            return
+        self.accept()
+
+    def get_loops(self) -> list[int]:
+        """Return loop counts per video in order."""
+        return list(self._loops)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ImageManager:
