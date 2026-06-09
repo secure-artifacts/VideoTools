@@ -12,7 +12,7 @@ from PyQt6.QtCore import Qt, QEvent, QSettings
 from Video.video_manager import VideoManager
 from image_worker.ffmpeg_worker import FFmpegWorker
 from image_worker.audio_library import AudioLibrary, SUPPORTED_AUDIO_EXT
-from UI.ui_image_merger import AudioSelectDialog, ClickableFrame, IrregularSegmentsDialog
+from UI.ui_image_merger import AudioSelectDialog, ClickableFrame, IrregularSegmentsDialog, LoopModeDialog
 
 class VideoMergerUI(QWidget):
     def __init__(self):
@@ -21,6 +21,7 @@ class VideoMergerUI(QWidget):
         self.audio_library = AudioLibrary()
         self.selected_audios: list[str] = []   # ordered list of selected audio paths
         self.irregular_segments: list[int] = []  # 不规则合并片段列表
+        self.loop_counts: list[int] = []           # 循环模式：每个视频的循环次数
         self.worker = None
         self.base_dir = "" # 保存用户选择的基础目录
         self.output_dir = ""
@@ -72,6 +73,17 @@ class VideoMergerUI(QWidget):
         self._toggle_irregular_mode()
         self._update_irregular_label()
 
+        # 恢复循环模式设置
+        try:
+            raw_loop = self.settings.value("v_loop_counts", "[]")
+            self.loop_counts = json.loads(raw_loop) if raw_loop else []
+        except Exception:
+            self.loop_counts = []
+        loop_on = self.settings.value("v_loop_on", False, type=bool)
+        self.check_loop_mode.setChecked(loop_on)
+        self._toggle_loop_mode()
+        self._update_loop_label()
+
     def save_settings(self):
         """保存当前界面的所有参数配置"""
         self.settings.setValue("v_merge_count", self.spin_merge_count.value())
@@ -91,6 +103,8 @@ class VideoMergerUI(QWidget):
         import json
         self.settings.setValue("v_irregular_segments", json.dumps(self.irregular_segments))
         self.settings.setValue("v_irregular_on", self.check_irregular.isChecked())
+        self.settings.setValue("v_loop_counts", json.dumps(self.loop_counts))
+        self.settings.setValue("v_loop_on", self.check_loop_mode.isChecked())
 
     def create_card(self, title):
         card = QFrame()
@@ -238,6 +252,24 @@ class VideoMergerUI(QWidget):
         self.lbl_irregular_summary.setStyleSheet("color: #4b5563; font-size: 9pt;")
         irr_row.addWidget(self.lbl_irregular_summary, 1)
         layout_params.addLayout(irr_row)
+
+        # ── 循环模式行 ─────────────────────────────────────────────────────────
+        loop_row = QHBoxLayout()
+        loop_row.setSpacing(10)
+        self.check_loop_mode = QCheckBox("🔁 循环模式")
+        self.check_loop_mode.setToolTip(
+            "开启后，每行指定对应视频素材的循环次数，\n"
+            "每个输出视频仅包含单一素材循环合并。\n"
+            "与不规则模式互斥，开启循环模式将自动关闭不规则模式。"
+        )
+        loop_row.addWidget(self.check_loop_mode)
+        self.btn_loop_config = QPushButton("📋 点击配置循环")
+        self.btn_loop_config.setEnabled(False)
+        loop_row.addWidget(self.btn_loop_config)
+        self.lbl_loop_summary = QLabel("（未配置）")
+        self.lbl_loop_summary.setStyleSheet("color: #4b5563; font-size: 9pt;")
+        loop_row.addWidget(self.lbl_loop_summary, 1)
+        layout_params.addLayout(loop_row)
 
         main_layout.addWidget(card_params)
 
@@ -397,6 +429,9 @@ class VideoMergerUI(QWidget):
         # 不规则合并模式
         self.check_irregular.stateChanged.connect(lambda _: self._toggle_irregular_mode())
         self.btn_irregular_config.clicked.connect(self._open_irregular_dialog)
+        # 循环模式
+        self.check_loop_mode.stateChanged.connect(lambda _: self._toggle_loop_mode())
+        self.btn_loop_config.clicked.connect(self._open_loop_dialog)
         # 音频库管理
         self.btn_add_audio.clicked.connect(self._add_audio_files)
         self.btn_add_audio_folder.clicked.connect(self._add_audio_folder)
@@ -432,8 +467,14 @@ class VideoMergerUI(QWidget):
 
     def _toggle_irregular_mode(self):
         is_irr = self.check_irregular.isChecked()
-        self.spin_merge_count.setEnabled(not is_irr)
-        self.spin_output_count.setEnabled(not is_irr)
+        # 与循环模式互斥
+        if is_irr and self.check_loop_mode.isChecked():
+            self.check_loop_mode.blockSignals(True)
+            self.check_loop_mode.setChecked(False)
+            self.check_loop_mode.blockSignals(False)
+            self._toggle_loop_mode()
+        self.spin_merge_count.setEnabled(not is_irr and not self.check_loop_mode.isChecked())
+        self.spin_output_count.setEnabled(not is_irr and not self.check_loop_mode.isChecked())
         self.btn_irregular_config.setEnabled(is_irr)
 
     def _open_irregular_dialog(self):
@@ -454,6 +495,42 @@ class VideoMergerUI(QWidget):
         else:
             self.lbl_irregular_summary.setText("（未配置）")
             self.lbl_irregular_summary.setStyleSheet("color: #4b5563; font-size: 9pt;")
+
+    # ── 循环模式 ──────────────────────────────────────────────────────────
+
+    def _toggle_loop_mode(self):
+        is_loop = self.check_loop_mode.isChecked()
+        # 与不规则模式互斥
+        if is_loop and self.check_irregular.isChecked():
+            self.check_irregular.blockSignals(True)
+            self.check_irregular.setChecked(False)
+            self.check_irregular.blockSignals(False)
+            self.btn_irregular_config.setEnabled(False)
+        is_any_special = is_loop or self.check_irregular.isChecked()
+        self.spin_merge_count.setEnabled(not is_any_special)
+        self.spin_output_count.setEnabled(not is_any_special)
+        # 循环模式强制按顺序合并，禁用合并顺序下拉
+        self.combo_order.setEnabled(not is_loop)
+        self.btn_loop_config.setEnabled(is_loop)
+
+    def _open_loop_dialog(self):
+        dlg = LoopModeDialog(self.loop_counts, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.loop_counts = dlg.get_loops()
+            self._update_loop_label()
+
+    def _update_loop_label(self):
+        if self.loop_counts:
+            preview = ", ".join(str(n) for n in self.loop_counts[:8])
+            if len(self.loop_counts) > 8:
+                preview += "..."
+            self.lbl_loop_summary.setText(
+                f"共{len(self.loop_counts)}个视频 · 循环次数：{preview}")
+            self.lbl_loop_summary.setStyleSheet(
+                "color: #f43f5e; font-size: 9pt; font-weight: bold;")
+        else:
+            self.lbl_loop_summary.setText("（未配置）")
+            self.lbl_loop_summary.setStyleSheet("color: #4b5563; font-size: 9pt;")
 
     # ── 音频库管理 ─────────────────────────────────────────────────────────
 
@@ -584,6 +661,7 @@ class VideoMergerUI(QWidget):
         output_count = self.spin_output_count.value()
         merge_mode = self.combo_order.currentText()
 
+        # ── 确定任务列表 ──────────────────────────────────────────────────
         # 不规则模式：使用自定义片段数列表
         if self.check_irregular.isChecked():
             if not self.irregular_segments:
@@ -591,24 +669,52 @@ class VideoMergerUI(QWidget):
                     "不规则模式已开启，但未配置片段列表，请先点击「点击配置列表」输入数据。")
                 return
             segment_list = self.irregular_segments
+        elif self.check_loop_mode.isChecked():
+            # 循环模式：按顺序强制
+            merge_mode = "按顺序合并"
+            if not self.loop_counts:
+                QMessageBox.warning(self, "警告",
+                    "循环模式已开启，但未配置循环次数，请先点击「点击配置循环」输入数据。")
+                return
+            segment_list = None   # 循环模式单独处理
         else:
             segment_list = [merge_count] * output_count
 
         tasks = []
         current_seq = 1
 
-        for count in segment_list:
-            task_videos = self.video_manager.get_videos_for_merge(count, mode=merge_mode)
-            if not task_videos: break
+        if self.check_loop_mode.isChecked():
+            # ── 循环模式：第 i 行 → 第 i 个文件，重复 loop_counts[i] 次 ──
+            all_videos = [self.file_list.item(j).text() for j in range(self.file_list.count())]
+            # 以文件数量为上限
+            effective = min(len(self.loop_counts), len(all_videos))
+            for idx in range(effective):
+                video_path = all_videos[idx]
+                loop_n = self.loop_counts[idx]
+                # 该视频重复 loop_n 次组成 task_videos
+                task_videos = [video_path] * loop_n
 
-            while True:
-                raw_path = os.path.join(self.output_dir, f"{prefix}_{current_seq:03d}.mp4")
-                output_file = os.path.normpath(raw_path)
-                if not os.path.exists(output_file): break
+                while True:
+                    raw_path = os.path.join(self.output_dir, f"{prefix}_{current_seq:03d}.mp4")
+                    output_file = os.path.normpath(raw_path)
+                    if not os.path.exists(output_file): break
+                    current_seq += 1
+
+                tasks.append({"videos": task_videos, "output_file": output_file})
                 current_seq += 1
+        else:
+            for count in segment_list:
+                task_videos = self.video_manager.get_videos_for_merge(count, mode=merge_mode)
+                if not task_videos: break
 
-            tasks.append({"videos": task_videos, "output_file": output_file})
-            current_seq += 1
+                while True:
+                    raw_path = os.path.join(self.output_dir, f"{prefix}_{current_seq:03d}.mp4")
+                    output_file = os.path.normpath(raw_path)
+                    if not os.path.exists(output_file): break
+                    current_seq += 1
+
+                tasks.append({"videos": task_videos, "output_file": output_file})
+                current_seq += 1
 
         if not tasks: return
 

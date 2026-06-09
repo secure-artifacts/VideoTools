@@ -29,14 +29,34 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Build with PyInstaller
+      - name: Download ffmpeg for bundling
+        shell: pwsh
         run: |
-          pyinstaller videotools.spec --distpath dist
+          # GitHub-hosted Windows runners have ffmpeg in PATH, but we need it in ./ffmpeg/ for bundling
+          $ffmpegDir = "ffmpeg"
+          New-Item -ItemType Directory -Path $ffmpegDir -Force | Out-Null
+          # Download a portable ffmpeg build for Windows
+          $url = "https://github.com/BtbN/ffmpeg-builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+          Invoke-WebRequest -Uri $url -OutFile "ffmpeg-build.zip" -UseBasicParsing
+          Expand-Archive -Path "ffmpeg-build.zip" -DestinationPath "ffmpeg-extracted" -Force
+          # Find and copy ffmpeg.exe and ffprobe.exe
+          $binDir = Get-ChildItem -Path "ffmpeg-extracted" -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1 -ExpandProperty DirectoryName
+          Copy-Item "$binDir\ffmpeg.exe" "ffmpeg\ffmpeg.exe"
+          Copy-Item "$binDir\ffprobe.exe" "ffmpeg\ffprobe.exe"
+          Write-Host "ffmpeg.exe: $((Get-Item 'ffmpeg\ffmpeg.exe').Length / 1MB)MB"
+          Write-Host "ffprobe.exe: $((Get-Item 'ffmpeg\ffprobe.exe').Length / 1MB)MB"
+
+      - name: Build with PyInstaller
+        shell: pwsh
+        run: |
+          pyinstaller videotools.spec --distpath dist --noconfirm
 
       - name: Create ZIP archive
         shell: pwsh
         run: |
-          Compress-Archive -Path dist\VideoTools -DestinationPath "dist\VideoTools-${{ github.ref_name }}-windows.zip"
+          $zipName = "VideoTools-${{ github.ref_name }}-windows.zip"
+          Compress-Archive -Path "dist\VideoTools" -DestinationPath "dist\$zipName"
+          Write-Host "Created: dist\$zipName ($([Math]::Round((Get-Item "dist\$zipName").Length/1MB,1))MB)"
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v2
