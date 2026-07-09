@@ -26,6 +26,7 @@ from UI.ui import VideoMergerUI
 from UI.ui_image_merger import ImageMergerUI
 from UI.ui_image_cropper import ImageCropperUI
 from UI.ui_multi_segment import MultiSegmentUI
+from UI.ui_youtube_downloader import YouTubeDownloaderUI
 
 class ToolboxApp(QMainWindow):
 
@@ -37,7 +38,7 @@ class ToolboxApp(QMainWindow):
         except Exception:
             pass
 
-        self.setWindowTitle("视频集成工具 2.4")
+        self.setWindowTitle("视频集成工具 2.5")
         self.setMinimumSize(1000, 750)
         self.setWindowIcon(QIcon(resource_path(os.path.join("log", "log.ico")))) 
         
@@ -71,8 +72,9 @@ class ToolboxApp(QMainWindow):
         self.btn_nav_img_merge = QPushButton("✨ 图片合并成视频") 
         self.btn_nav_image = QPushButton("🖼️ 图片批量裁剪")
         self.btn_nav_multi = QPushButton("🎞️ 多片段合成")
+        self.btn_nav_youtube = QPushButton("📥 YouTube下载")
         
-        for btn in [self.btn_nav_video, self.btn_nav_img_merge, self.btn_nav_image, self.btn_nav_multi]:
+        for btn in [self.btn_nav_video, self.btn_nav_img_merge, self.btn_nav_image, self.btn_nav_multi, self.btn_nav_youtube]:
             btn.setCheckable(True)
             btn.setProperty("class", "NavBtn")
             nav_layout.addWidget(btn)
@@ -94,11 +96,13 @@ class ToolboxApp(QMainWindow):
         self.img_merge_tool = ImageMergerUI()
         self.image_tool = ImageCropperUI()
         self.multi_segment_tool = MultiSegmentUI()
+        self.youtube_tool = YouTubeDownloaderUI()
         
         self.stacked_widget.addWidget(self.video_tool)
         self.stacked_widget.addWidget(self.img_merge_tool)
         self.stacked_widget.addWidget(self.image_tool)
         self.stacked_widget.addWidget(self.multi_segment_tool)
+        self.stacked_widget.addWidget(self.youtube_tool)
 
         self.main_layout.addWidget(self.stacked_widget)
 
@@ -106,7 +110,8 @@ class ToolboxApp(QMainWindow):
         self.btn_nav_img_merge.clicked.connect(lambda: self.switch_tab(1, self.btn_nav_img_merge))
         self.btn_nav_image.clicked.connect(lambda: self.switch_tab(2, self.btn_nav_image))
         self.btn_nav_multi.clicked.connect(lambda: self.switch_tab(3, self.btn_nav_multi))
-        self.nav_buttons = [self.btn_nav_video, self.btn_nav_img_merge, self.btn_nav_image, self.btn_nav_multi]
+        self.btn_nav_youtube.clicked.connect(lambda: self.switch_tab(4, self.btn_nav_youtube))
+        self.nav_buttons = [self.btn_nav_video, self.btn_nav_img_merge, self.btn_nav_image, self.btn_nav_multi, self.btn_nav_youtube]
 
     def switch_tab(self, index, active_btn):
         self.stacked_widget.setCurrentIndex(index)
@@ -191,6 +196,7 @@ class ToolboxApp(QMainWindow):
         self.img_merge_tool.save_settings()
         self.image_tool.save_settings()
         self.multi_segment_tool.save_settings()
+        self.youtube_tool.save_settings()
         event.accept()
 
 if __name__ == "__main__":
