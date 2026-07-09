@@ -1,5 +1,5 @@
 PyQt6>=6.4.0
 Pillow>=9.0.0
-pyinstaller>=5.0.0
+pyinstaller>=6.21.0
 openai-whisper>=20231117
 yt-dlp>=2024.1.0
