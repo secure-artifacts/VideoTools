@@ -2,6 +2,7 @@ import os
 import sys
 import subprocess
 import re
+import shutil
 import threading
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -10,38 +11,94 @@ from PyQt6.QtWidgets import (
     QScrollArea, QSizePolicy, QMessageBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QColor
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  后台工作线程
+#  工具函数：探测 Node.js / Deno / yt-dlp 路径
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _find_exe(name: str) -> str:
+    """返回可执行文件的完整路径，找不到返回空字符串。"""
+    return shutil.which(name) or ""
+
+
+def _ytdlp_version() -> str:
+    exe = _find_exe("yt-dlp")
+    if not exe:
+        return ""
+    try:
+        r = subprocess.run(
+            [exe, "--version"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _node_path() -> str:
+    """返回 node 可执行文件路径，找不到返回空字符串。"""
+    return _find_exe("node")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  yt-dlp 更新线程
+# ─────────────────────────────────────────────────────────────────────────────
+
+class UpdateWorker(QThread):
+    """在后台线程中执行 pip install --upgrade yt-dlp。"""
+    log_line  = pyqtSignal(str)
+    finished  = pyqtSignal(bool, str)   # (success, new_version)
+
+    def run(self):
+        self.log_line.emit("[UPDATE] 正在升级 yt-dlp，请稍候...")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+            for line in proc.stdout:
+                self.log_line.emit(f"[pip] {line.rstrip()}")
+            proc.wait()
+            if proc.returncode == 0:
+                ver = _ytdlp_version()
+                self.finished.emit(True, ver)
+            else:
+                self.finished.emit(False, "")
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  下载工作线程
 # ─────────────────────────────────────────────────────────────────────────────
 
 class YtdlpWorker(QThread):
     """在后台线程中逐条下载 YouTube 链接，实时回报进度。"""
 
-    # (index, status_text, percent)
-    item_progress = pyqtSignal(int, str, int)
-    # (index, success, message)
-    item_done = pyqtSignal(int, bool, str)
-    # (total_percent, status_text)
-    overall_progress = pyqtSignal(int, str)
-    # (success, message)  整体完成
-    all_done = pyqtSignal(bool, str)
-    # 原始日志行（用于错误面板）
-    log_line = pyqtSignal(str)
+    item_progress   = pyqtSignal(int, str, int)   # (idx, text, pct)
+    item_done       = pyqtSignal(int, bool, str)  # (idx, ok, msg)
+    overall_progress= pyqtSignal(int, str)         # (pct, text)
+    all_done        = pyqtSignal(bool, str)        # (ok, msg)
+    log_line        = pyqtSignal(str)              # raw log
 
     def __init__(self, urls: list[str], fmt: str, quality: str,
-                 threads: int, output_dir: str, ffmpeg_dir: str):
+                 threads: int, output_dir: str, ffmpeg_dir: str,
+                 node_path: str):
         super().__init__()
-        self.urls = urls
-        self.fmt = fmt
-        self.quality = quality
-        self.threads = threads
+        self.urls       = urls
+        self.fmt        = fmt
+        self.quality    = quality
+        self.threads    = threads
         self.output_dir = output_dir
         self.ffmpeg_dir = ffmpeg_dir
-        self._stop_flag = False
-        self._current_proc = None
+        self.node_path  = node_path
+        self._stop_flag   = False
+        self._current_proc= None
 
     def stop(self):
         self._stop_flag = True
@@ -50,14 +107,17 @@ class YtdlpWorker(QThread):
 
     # ------------------------------------------------------------------
     def _build_args(self) -> list[str]:
-        """根据格式/画质设置构造 yt-dlp 命令行参数（不含 URL）。"""
-        args = ["yt-dlp", "--newline", "--no-playlist"]
+        args = ["yt-dlp", "--newline", "--no-playlist", "--no-update"]
 
         # ffmpeg 路径
         if self.ffmpeg_dir and os.path.isdir(self.ffmpeg_dir):
             args += ["--ffmpeg-location", self.ffmpeg_dir]
 
-        # 并发片段数（yt-dlp 内置分片下载）
+        # Node.js JS 运行时（避免 "No supported JavaScript runtime" 警告）
+        if self.node_path:
+            args += ["--js-runtimes", f"node:{self.node_path}"]
+
+        # 并发片段数
         args += ["--concurrent-fragments", str(self.threads)]
 
         # 输出模板
@@ -65,44 +125,24 @@ class YtdlpWorker(QThread):
         args += ["-o", out_template]
 
         if self.fmt == "MP3（仅音频）":
-            # 纯音频：提取最佳音质并转为 mp3
-            args += [
-                "-x",
-                "--audio-format", "mp3",
-                "--audio-quality", "0",
-            ]
+            args += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
         else:
-            # ── 修复：不在视频流上指定 ext，由 ffmpeg 负责最终格式转换 ──
-            # YouTube 的 DASH 流通常是 webm/mp4，直接限定 ext 会导致 code 1
             height_map = {
-                "480p":       "480",
-                "720p":       "720",
-                "1080p":      "1080",
-                "2K (1440p)": "1440",
-                "4K (2160p)": "2160",
+                "480p": "480", "720p": "720", "1080p": "1080",
+                "2K (1440p)": "1440", "4K (2160p)": "2160",
             }
             h = height_map.get(self.quality, "1080")
-
-            # 格式优先级：
-            #   1. 目标高度内最佳视频 + m4a 音频（最兼容）
-            #   2. 目标高度内最佳视频 + 任意最佳音频
-            #   3. 目标高度内合并流
-            #   4. 任意最佳（兜底）
+            # 不在视频流上限定 ext，让 ffmpeg 负责格式转换
             fmt_sel = (
                 f"bestvideo[height<={h}]+bestaudio[ext=m4a]/"
                 f"bestvideo[height<={h}]+bestaudio/"
                 f"best[height<={h}]/best"
             )
-            args += [
-                "-f", fmt_sel,
-                "--merge-output-format", self.fmt,
-            ]
+            args += ["-f", fmt_sel, "--merge-output-format", self.fmt]
 
         return args
 
-    # ------------------------------------------------------------------
     def _read_stderr(self, proc, stderr_lines: list):
-        """在独立线程中持续读取 stderr，防止管道阻塞。"""
         try:
             for line in proc.stderr:
                 line = line.strip()
@@ -115,16 +155,15 @@ class YtdlpWorker(QThread):
     def run(self):
         total = len(self.urls)
         base_args = self._build_args()
-        succeeded = 0
-        failed = 0
+        succeeded = failed = 0
 
         for idx, url in enumerate(self.urls):
             if self._stop_flag:
                 break
 
             self.item_progress.emit(idx, "⏳ 正在连接...", 0)
-            overall_pct = int(idx / total * 100)
-            self.overall_progress.emit(overall_pct, f"正在下载第 {idx+1}/{total} 个...")
+            self.overall_progress.emit(int(idx / total * 100),
+                                       f"正在下载第 {idx+1}/{total} 个...")
             self.log_line.emit(f"\n{'─'*60}")
             self.log_line.emit(f"[{idx+1}/{total}] 开始下载: {url}")
 
@@ -135,38 +174,32 @@ class YtdlpWorker(QThread):
                 self._current_proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,   # ← 修复：单独捕获 stderr
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
+                    stderr=subprocess.PIPE,
+                    text=True, encoding="utf-8", errors="replace",
                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                 )
 
                 stderr_lines: list[str] = []
-                # 用独立线程读 stderr，防止死锁
-                stderr_thread = threading.Thread(
+                t = threading.Thread(
                     target=self._read_stderr,
                     args=(self._current_proc, stderr_lines),
                     daemon=True,
                 )
-                stderr_thread.start()
+                t.start()
 
                 last_pct = 0
                 for line in self._current_proc.stdout:
                     if self._stop_flag:
                         self._current_proc.terminate()
                         break
-
                     line = line.strip()
                     if not line:
                         continue
-
                     self.log_line.emit(f"[OUT] {line}")
 
-                    # 解析进度行，例如: [download]  45.3% of ...
                     m = re.search(r"\[download\]\s+([\d.]+)%", line)
                     if m:
-                        pct = int(float(m.group(1)))
+                        pct = min(int(float(m.group(1))), 100)
                         last_pct = pct
                         self.item_progress.emit(idx, f"⏳ 下载中 {pct}%", pct)
                         fine = (idx + pct / 100) / total * 100
@@ -177,7 +210,7 @@ class YtdlpWorker(QThread):
                     elif "[ExtractAudio]" in line or "Destination:" in line:
                         self.item_progress.emit(idx, "🎵 转码中...", last_pct)
 
-                stderr_thread.join(timeout=5)
+                t.join(timeout=5)
                 self._current_proc.wait()
                 retcode = self._current_proc.returncode
 
@@ -187,22 +220,18 @@ class YtdlpWorker(QThread):
                 elif retcode == 0:
                     succeeded += 1
                     self.item_done.emit(idx, True, "✅ 下载完成")
-                    self.log_line.emit(f"[OK] 第 {idx+1} 个下载成功")
                 else:
                     failed += 1
-                    # 将 stderr 最后几行作为错误摘要显示
-                    err_summary = " | ".join(stderr_lines[-3:]) if stderr_lines else f"code {retcode}"
-                    # 截断过长的错误摘要
-                    if len(err_summary) > 120:
-                        err_summary = err_summary[:117] + "..."
-                    self.item_done.emit(idx, False, f"❌ 失败: {err_summary}")
-                    self.log_line.emit(f"[FAIL] code={retcode}, 原因: {err_summary}")
+                    # 智能错误摘要：识别常见错误类型给出中文提示
+                    err_text = " ".join(stderr_lines)
+                    reason = _classify_error(err_text, retcode)
+                    self.item_done.emit(idx, False, f"❌ {reason}")
+                    self.log_line.emit(f"[FAIL] code={retcode} | {reason}")
 
             except FileNotFoundError:
                 failed += 1
-                msg = "❌ 找不到 yt-dlp，请先执行: pip install yt-dlp"
-                self.item_done.emit(idx, False, msg)
-                self.log_line.emit(f"[FAIL] {msg}")
+                self.item_done.emit(idx, False, "❌ 找不到 yt-dlp，请先安装")
+                self.log_line.emit("[FAIL] 找不到 yt-dlp")
                 break
             except Exception as e:
                 failed += 1
@@ -213,9 +242,37 @@ class YtdlpWorker(QThread):
             self.all_done.emit(False, f"已停止。完成 {succeeded} 个，失败 {failed} 个。")
         else:
             self.overall_progress.emit(100, "全部完成！")
-            ok = (failed == 0)
-            msg = f"全部下载完成！共 {succeeded} 个成功，{failed} 个失败。"
-            self.all_done.emit(ok, msg)
+            self.all_done.emit(failed == 0,
+                f"全部完成！{succeeded} 个成功，{failed} 个失败。")
+
+
+def _classify_error(err_text: str, code: int) -> str:
+    """将 yt-dlp 错误信息翻译为简洁的中文原因。"""
+    t = err_text.lower()
+    if "this video is not available" in t:
+        return "视频不可用（可能地区限制或已下架）"
+    if "private video" in t:
+        return "私人视频，无法下载"
+    if "sign in" in t or "login" in t:
+        return "需要登录账号才能下载（年龄限制或会员内容）"
+    if "copyright" in t:
+        return "版权限制，该视频无法下载"
+    if "no video formats" in t or "no formats" in t:
+        return "找不到可用的视频格式（尝试更新 yt-dlp）"
+    if "http error 429" in t:
+        return "请求过于频繁（HTTP 429），请稍后再试"
+    if "http error 403" in t:
+        return "访问被拒绝（HTTP 403），可能需要 Cookie"
+    if "network" in t or "connection" in t:
+        return "网络连接失败"
+    if "javascript" in t or "js runtime" in t:
+        return "缺少 JS 运行时（Node.js），请安装后重试"
+    if "unable to extract" in t:
+        return "无法解析视频信息（请更新 yt-dlp）"
+    # 兜底：返回最后一条错误行
+    lines = [l.strip() for l in err_text.splitlines() if l.strip()]
+    last = lines[-1] if lines else f"未知错误 (code {code})"
+    return last[:100]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -223,11 +280,11 @@ class YtdlpWorker(QThread):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class YouTubeDownloaderUI(QWidget):
-    """YouTube 视频/音频批量下载界面。"""
 
     def __init__(self):
         super().__init__()
         self.worker: YtdlpWorker | None = None
+        self.update_worker: UpdateWorker | None = None
         self.output_dir = ""
         self.settings = QSettings("MyCompany", "VideoToolbox")
         self._item_widgets: dict[int, QListWidgetItem] = {}
@@ -235,16 +292,14 @@ class YouTubeDownloaderUI(QWidget):
         self._setup_ui()
         self._bind_events()
         self.load_settings()
+        self._refresh_env_status()   # 检测运行环境
 
     # ── 设置持久化 ────────────────────────────────────────────────────────
 
     def load_settings(self):
-        self.combo_format.setCurrentText(
-            self.settings.value("yt_format", "mp4"))
-        self.combo_quality.setCurrentText(
-            self.settings.value("yt_quality", "1080p"))
-        self.spin_threads.setValue(
-            self.settings.value("yt_threads", 4, type=int))
+        self.combo_format.setCurrentText(self.settings.value("yt_format", "mp4"))
+        self.combo_quality.setCurrentText(self.settings.value("yt_quality", "1080p"))
+        self.spin_threads.setValue(self.settings.value("yt_threads", 4, type=int))
         saved_dir = self.settings.value("yt_output_dir", "")
         if saved_dir and os.path.isdir(saved_dir):
             self.output_dir = saved_dir
@@ -252,10 +307,31 @@ class YouTubeDownloaderUI(QWidget):
         self._on_format_changed()
 
     def save_settings(self):
-        self.settings.setValue("yt_format", self.combo_format.currentText())
-        self.settings.setValue("yt_quality", self.combo_quality.currentText())
-        self.settings.setValue("yt_threads", self.spin_threads.value())
+        self.settings.setValue("yt_format",     self.combo_format.currentText())
+        self.settings.setValue("yt_quality",    self.combo_quality.currentText())
+        self.settings.setValue("yt_threads",    self.spin_threads.value())
         self.settings.setValue("yt_output_dir", self.output_dir)
+
+    # ── 运行环境检测 ──────────────────────────────────────────────────────
+
+    def _refresh_env_status(self):
+        """检测 yt-dlp 版本 和 Node.js，更新状态栏。"""
+        ver = _ytdlp_version()
+        node = _node_path()
+
+        if ver:
+            self.lbl_ytdlp_ver.setText(f"yt-dlp {ver}")
+            self.lbl_ytdlp_ver.setStyleSheet("color: #22c55e; font-size: 9pt; font-weight: bold;")
+        else:
+            self.lbl_ytdlp_ver.setText("yt-dlp 未安装")
+            self.lbl_ytdlp_ver.setStyleSheet("color: #ef4444; font-size: 9pt; font-weight: bold;")
+
+        if node:
+            self.lbl_node_status.setText(f"✅ Node.js: {node}")
+            self.lbl_node_status.setStyleSheet("color: #22c55e; font-size: 9pt;")
+        else:
+            self.lbl_node_status.setText("⚠️ Node.js 未安装（部分视频可能无法下载）")
+            self.lbl_node_status.setStyleSheet("color: #f59e0b; font-size: 9pt;")
 
     # ── UI 构建 ───────────────────────────────────────────────────────────
 
@@ -271,7 +347,6 @@ class YouTubeDownloaderUI(QWidget):
         return card, layout
 
     def _setup_ui(self):
-        # 外层滚动区域，与其他标签页完全一致
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -291,10 +366,31 @@ class YouTubeDownloaderUI(QWidget):
         main.setContentsMargins(0, 0, 1, 0)
         main.setSpacing(10)
 
+        # ── 环境状态栏 ────────────────────────────────────────────────────
+        env_card, env_lay = self._create_card("🛠 运行环境状态")
+        env_row = QHBoxLayout()
+
+        self.lbl_ytdlp_ver = QLabel("检测中...")
+        self.lbl_ytdlp_ver.setStyleSheet("color: #6b7280; font-size: 9pt;")
+        env_row.addWidget(self.lbl_ytdlp_ver)
+
+        self.btn_update_ytdlp = QPushButton("⬆ 一键更新 yt-dlp")
+        self.btn_update_ytdlp.setFixedWidth(160)
+        self.btn_update_ytdlp.setToolTip("yt-dlp 版本超过 30 天建议更新，以支持最新 YouTube API")
+        env_row.addWidget(self.btn_update_ytdlp)
+
+        env_row.addSpacing(20)
+        self.lbl_node_status = QLabel("检测中...")
+        env_row.addWidget(self.lbl_node_status)
+
+        env_row.addStretch()
+        env_lay.addLayout(env_row)
+        main.addWidget(env_card)
+
         # ── 板块一：链接输入 ──────────────────────────────────────────────
         card1, lay1 = self._create_card("🔗 板块一 · 输入 YouTube 链接（每行一个）")
 
-        hint = QLabel("支持批量粘贴，每行对应一个视频链接。含播放列表参数（&list=...）的链接自动只下载单个视频。")
+        hint = QLabel("支持批量粘贴，每行一个链接。含播放列表参数（&list=...）的链接自动只下载单个视频。")
         hint.setStyleSheet("color: #6b7280; font-size: 9pt;")
         hint.setWordWrap(True)
         lay1.addWidget(hint)
@@ -314,7 +410,6 @@ class YouTubeDownloaderUI(QWidget):
         self.btn_clear_urls = QPushButton("🗑 清空链接")
         url_btn_row.addWidget(self.btn_clear_urls)
         lay1.addLayout(url_btn_row)
-
         main.addWidget(card1)
 
         # ── 板块二：参数设置 ──────────────────────────────────────────────
@@ -323,7 +418,6 @@ class YouTubeDownloaderUI(QWidget):
         params_row1 = QHBoxLayout()
         params_row1.setSpacing(20)
 
-        # 格式
         fmt_col = QVBoxLayout()
         fmt_col.setSpacing(4)
         fmt_col.addWidget(QLabel("输出格式："))
@@ -333,7 +427,6 @@ class YouTubeDownloaderUI(QWidget):
         fmt_col.addWidget(self.combo_format)
         params_row1.addLayout(fmt_col)
 
-        # 画质
         qual_col = QVBoxLayout()
         qual_col.setSpacing(4)
         self.lbl_quality = QLabel("视频画质：")
@@ -344,28 +437,21 @@ class YouTubeDownloaderUI(QWidget):
         qual_col.addWidget(self.combo_quality)
         params_row1.addLayout(qual_col)
 
-        # 线程数
         thread_col = QVBoxLayout()
         thread_col.setSpacing(4)
-        thread_col.addWidget(QLabel("并发线程数（分片下载）："))
+        thread_col.addWidget(QLabel("并发线程数："))
         self.spin_threads = QSpinBox()
         self.spin_threads.setRange(1, 32)
         self.spin_threads.setValue(4)
         self.spin_threads.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
         self.spin_threads.setMinimumWidth(100)
-        self.spin_threads.setToolTip(
-            "控制单个视频的并发分片下载数量。\n"
-            "建议值：4~8（线程越多对服务器压力越大）"
-        )
         thread_col.addWidget(self.spin_threads)
         params_row1.addLayout(thread_col)
 
         params_row1.addStretch()
         lay2.addLayout(params_row1)
 
-        # 输出目录
         out_row = QHBoxLayout()
-        out_row.setSpacing(10)
         self.btn_out_path = QPushButton("📁 选择输出目录")
         self.btn_out_path.setFixedWidth(150)
         self.lbl_out_path = QLabel("尚未选择输出目录")
@@ -373,13 +459,11 @@ class YouTubeDownloaderUI(QWidget):
         out_row.addWidget(self.btn_out_path)
         out_row.addWidget(self.lbl_out_path, 1)
         lay2.addLayout(out_row)
-
         main.addWidget(card2)
 
         # ── 板块三：进度面板 ──────────────────────────────────────────────
         card3, lay3 = self._create_card("📊 板块三 · 下载进度")
 
-        # 每条链接的状态列表
         self.list_progress = QListWidget()
         self.list_progress.setMinimumHeight(160)
         self.list_progress.setAlternatingRowColors(False)
@@ -387,45 +471,33 @@ class YouTubeDownloaderUI(QWidget):
         self.list_progress.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         lay3.addWidget(self.list_progress)
 
-        # 总体进度条
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
         self.progress_bar.setFixedHeight(18)
-        self.progress_bar.setTextVisible(True)
         lay3.addWidget(self.progress_bar)
 
-        # 状态文本
         self.lbl_status = QLabel("就绪 — 请输入链接并点击「开始下载」")
         self.lbl_status.setStyleSheet("color: #6b7280; font-size: 9pt;")
         lay3.addWidget(self.lbl_status)
 
-        # 操作按钮行
         btn_row = QHBoxLayout()
         self.btn_start = QPushButton("🚀 开始下载")
         self.btn_start.setObjectName("PrimaryBtn")
         self.btn_start.setFixedHeight(46)
-
         self.btn_stop = QPushButton("🛑 停止下载")
         self.btn_stop.setEnabled(False)
         self.btn_stop.setFixedHeight(46)
-
         self.btn_clear_log = QPushButton("🗑 清空日志")
         self.btn_clear_log.setFixedHeight(46)
         self.btn_clear_log.setFixedWidth(110)
-
         btn_row.addWidget(self.btn_start, stretch=3)
         btn_row.addWidget(self.btn_stop, stretch=1)
         btn_row.addWidget(self.btn_clear_log)
         lay3.addLayout(btn_row)
-
         main.addWidget(card3)
 
-        # ── 板块四：错误日志 ──────────────────────────────────────────────
-        card4, lay4 = self._create_card("🔍 板块四 · 详细日志（可用于排查失败原因）")
-
-        log_hint = QLabel("下载过程中的所有输出实时显示在此，失败时可查看具体错误信息。")
-        log_hint.setStyleSheet("color: #6b7280; font-size: 9pt;")
-        lay4.addWidget(log_hint)
+        # ── 板块四：详细日志 ──────────────────────────────────────────────
+        card4, lay4 = self._create_card("🔍 板块四 · 详细日志（失败时可查看原因）")
 
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
@@ -437,7 +509,6 @@ class YouTubeDownloaderUI(QWidget):
             "border: 1px solid #30363d; border-radius: 6px; padding: 6px; }"
         )
         lay4.addWidget(self.log_view)
-
         main.addWidget(card4)
         main.addStretch()
 
@@ -450,6 +521,7 @@ class YouTubeDownloaderUI(QWidget):
         self.btn_stop.clicked.connect(self._stop_download)
         self.btn_clear_log.clicked.connect(self.log_view.clear)
         self.combo_format.currentTextChanged.connect(self._on_format_changed)
+        self.btn_update_ytdlp.clicked.connect(self._update_ytdlp)
 
     # ── 槽函数 ────────────────────────────────────────────────────────────
 
@@ -457,10 +529,6 @@ class YouTubeDownloaderUI(QWidget):
         is_audio = self.combo_format.currentText() == "MP3（仅音频）"
         self.combo_quality.setEnabled(not is_audio)
         self.lbl_quality.setEnabled(not is_audio)
-        if is_audio:
-            self.combo_quality.setToolTip("音频模式下无需设置画质")
-        else:
-            self.combo_quality.setToolTip("")
 
     def _select_output_dir(self):
         d = QFileDialog.getExistingDirectory(self, "选择输出目录")
@@ -471,8 +539,28 @@ class YouTubeDownloaderUI(QWidget):
 
     def _get_urls(self) -> list[str]:
         raw = self.text_urls.toPlainText().strip()
-        urls = [u.strip() for u in raw.splitlines() if u.strip()]
-        return urls
+        return [u.strip() for u in raw.splitlines() if u.strip()]
+
+    # ── 更新 yt-dlp ───────────────────────────────────────────────────────
+
+    def _update_ytdlp(self):
+        self.btn_update_ytdlp.setEnabled(False)
+        self.btn_update_ytdlp.setText("更新中...")
+        self.log_view.clear()
+        self.update_worker = UpdateWorker()
+        self.update_worker.log_line.connect(self._on_log_line)
+        self.update_worker.finished.connect(self._on_update_done)
+        self.update_worker.start()
+
+    def _on_update_done(self, success: bool, version: str):
+        self.btn_update_ytdlp.setEnabled(True)
+        self.btn_update_ytdlp.setText("⬆ 一键更新 yt-dlp")
+        self._refresh_env_status()
+        if success:
+            self._on_log_line(f"[UPDATE] ✅ 更新成功，当前版本：{version}")
+            QMessageBox.information(self, "更新完成", f"yt-dlp 已更新至 {version}")
+        else:
+            self._on_log_line("[UPDATE] ❌ 更新失败，请查看日志")
 
     # ── 开始下载 ──────────────────────────────────────────────────────────
 
@@ -485,10 +573,10 @@ class YouTubeDownloaderUI(QWidget):
             QMessageBox.warning(self, "提示", "请先选择输出目录！")
             return
 
-        # 初始化进度列表
         self.list_progress.clear()
         self._item_widgets.clear()
         self.log_view.clear()
+
         for idx, url in enumerate(urls):
             short = url if len(url) <= 60 else url[:57] + "..."
             item = QListWidgetItem(f"  [{idx+1:02d}]  {short}  —  ⏳ 等待中")
@@ -501,7 +589,6 @@ class YouTubeDownloaderUI(QWidget):
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
 
-        # 找 ffmpeg 目录
         if getattr(sys, 'frozen', False):
             _root = os.path.dirname(sys.executable)
         else:
@@ -517,6 +604,7 @@ class YouTubeDownloaderUI(QWidget):
             threads=self.spin_threads.value(),
             output_dir=self.output_dir,
             ffmpeg_dir=ffmpeg_dir,
+            node_path=_node_path(),
         )
         self.worker.item_progress.connect(self._on_item_progress)
         self.worker.item_done.connect(self._on_item_done)
@@ -550,10 +638,7 @@ class YouTubeDownloaderUI(QWidget):
         url = urls[idx] if idx < len(urls) else ""
         short = url if len(url) <= 55 else url[:52] + "..."
         item.setText(f"  [{idx+1:02d}]  {short}  —  {msg}")
-        if success:
-            item.setForeground(Qt.GlobalColor.green)
-        else:
-            item.setForeground(Qt.GlobalColor.red)
+        item.setForeground(Qt.GlobalColor.green if success else Qt.GlobalColor.red)
         self.list_progress.scrollToItem(item)
 
     def _on_overall_progress(self, pct: int, text: str):
@@ -561,9 +646,7 @@ class YouTubeDownloaderUI(QWidget):
         self.lbl_status.setText(text)
 
     def _on_log_line(self, line: str):
-        """将日志追加到日志面板，自动滚动到底部。"""
         self.log_view.appendPlainText(line)
-        # 滚动到最新行
         sb = self.log_view.verticalScrollBar()
         sb.setValue(sb.maximum())
 
