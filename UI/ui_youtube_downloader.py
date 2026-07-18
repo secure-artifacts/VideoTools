@@ -281,6 +281,9 @@ def _classify_error(err_text: str, code: int) -> str:
 
 class YouTubeDownloaderUI(QWidget):
 
+    # 后台线程检测完毕后，通过此信号安全地更新主线程 UI
+    _env_ready = pyqtSignal(str, str)   # (ytdlp_ver, node_path)
+
     def __init__(self):
         super().__init__()
         self.worker: YtdlpWorker | None = None
@@ -292,9 +295,11 @@ class YouTubeDownloaderUI(QWidget):
         self._setup_ui()
         self._bind_events()
         self.load_settings()
-        # 用 QTimer 延迟执行环境检测，避免 subprocess 阻塞主线程 UI 初始化
-        from PyQt6.QtCore import QTimer
-        QTimer.singleShot(200, self._refresh_env_status)
+        # 将信号连接到 UI 更新槽
+        self._env_ready.connect(self._apply_env_labels)
+        # 在后台守护线程中运行耗时的环境检测，主线程不阻塞
+        import threading
+        threading.Thread(target=self._refresh_env_status, daemon=True).start()
 
     # ── 设置持久化 ────────────────────────────────────────────────────────
 
@@ -314,13 +319,16 @@ class YouTubeDownloaderUI(QWidget):
         self.settings.setValue("yt_threads",    self.spin_threads.value())
         self.settings.setValue("yt_output_dir", self.output_dir)
 
-    # ── 运行环境检测 ──────────────────────────────────────────────────────
+    # ── 运行环境检测（在后台线程中运行，绝不阻塞主线程）────────────────────
 
     def _refresh_env_status(self):
-        """检测 yt-dlp 版本 和 Node.js，更新状态栏。"""
-        ver = _ytdlp_version()
-        node = _node_path()
+        """在后台守护线程中检测 yt-dlp 版本和 Node.js，完成后通过信号更新 UI。"""
+        ver  = _ytdlp_version()   # 可能耗时数秒，但不在主线程
+        node = _node_path()       # shutil.which，极快
+        self._env_ready.emit(ver, node)   # 安全地通知主线程更新 UI
 
+    def _apply_env_labels(self, ver: str, node: str):
+        """（主线程）收到信号后更新状态栏标签。"""
         if ver:
             self.lbl_ytdlp_ver.setText(f"yt-dlp {ver}")
             self.lbl_ytdlp_ver.setStyleSheet("color: #22c55e; font-size: 9pt; font-weight: bold;")
