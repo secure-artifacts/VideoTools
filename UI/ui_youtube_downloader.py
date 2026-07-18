@@ -292,7 +292,9 @@ class YouTubeDownloaderUI(QWidget):
         self._setup_ui()
         self._bind_events()
         self.load_settings()
-        self._refresh_env_status()   # 检测运行环境
+        # 用 QTimer 延迟执行环境检测，避免 subprocess 阻塞主线程 UI 初始化
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(200, self._refresh_env_status)
 
     # ── 设置持久化 ────────────────────────────────────────────────────────
 
