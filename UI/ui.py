@@ -6,7 +6,8 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QPushButton, QLabel, QSpinBox, QComboBox,
                              QCheckBox, QDoubleSpinBox, QFileDialog, QListWidget,
                              QListWidgetItem, QProgressBar, QMessageBox, QFrame,
-                             QSlider, QAbstractSpinBox, QDialog, QScrollArea, QSizePolicy)
+                             QSlider, QAbstractSpinBox, QDialog, QScrollArea,
+                             QSizePolicy, QInputDialog)
 from PyQt6.QtCore import Qt, QEvent, QSettings
 
 from Video.video_manager import VideoManager
@@ -22,6 +23,7 @@ class VideoMergerUI(QWidget):
         self.selected_audios: list[str] = []   # ordered list of selected audio paths
         self.irregular_segments: list[int] = []  # 不规则合并片段列表
         self.loop_counts: list[int] = []           # 循环模式：每个视频的循环次数
+        self.playlists: dict = {}              # 歌单：{name: [audio_path, ...]}
         self.worker = None
         self.base_dir = "" # 保存用户选择的基础目录
         self.output_dir = ""
@@ -59,7 +61,19 @@ class VideoMergerUI(QWidget):
         self.selected_audios = [p for p in saved_selected if p in library_paths]
         self._update_audio_select_bar()
 
-        self._toggle_music_panel()
+        # 恢复歌单
+        import json as _json
+        try:
+            raw_pl = self.settings.value("v_playlists", "{}")
+            loaded = _json.loads(raw_pl) if raw_pl else {}
+            self.playlists = {
+                name: [p for p in paths if p in library_paths]
+                for name, paths in loaded.items()
+                if isinstance(name, str) and isinstance(paths, list)
+            }
+        except Exception:
+            self.playlists = {}
+        self._refresh_playlist_combo()
 
         # 恢复不规则合并设置
         import json
@@ -105,6 +119,7 @@ class VideoMergerUI(QWidget):
         self.settings.setValue("v_irregular_on", self.check_irregular.isChecked())
         self.settings.setValue("v_loop_counts", json.dumps(self.loop_counts))
         self.settings.setValue("v_loop_on", self.check_loop_mode.isChecked())
+        self.settings.setValue("v_playlists", json.dumps(self.playlists, ensure_ascii=False))
 
     def create_card(self, title):
         card = QFrame()
@@ -278,8 +293,13 @@ class VideoMergerUI(QWidget):
 
         # 开关行
         music_toggle_row = QHBoxLayout()
-        self.check_add_music = QCheckBox("添加背景音乐（去掉原声后混入）")
+        self.check_add_music = QCheckBox("添加背景音乐")
         self.check_add_music.setChecked(False)
+        self.check_add_music.setToolTip(
+            "勾选后将把所选背景音乐混入输出视频。\n"
+            "• 若同时勾选了「去掉声音」，则去掉原声后替换为背景音乐；\n"
+            "• 若未勾选「去掉声音」，则保留原声并与背景音乐叠加混音。"
+        )
         music_toggle_row.addWidget(self.check_add_music)
         music_toggle_row.addStretch()
         layout_audio.addLayout(music_toggle_row)
@@ -382,6 +402,39 @@ class VideoMergerUI(QWidget):
         audio_params_grid.addWidget(vol_layout_widget, 1, 1, 1, 3)
 
         layout_audio.addLayout(audio_params_grid)
+
+        # ── 歌单管理区域 ────────────────────────────────────
+        playlist_sep = QFrame()
+        playlist_sep.setFrameShape(QFrame.Shape.HLine)
+        playlist_sep.setStyleSheet("color: #2d3748; margin: 4px 0;")
+        layout_audio.addWidget(playlist_sep)
+
+        playlist_title = QLabel("🎶  歌单管理")
+        playlist_title.setProperty("class", "CardTitle")
+        layout_audio.addWidget(playlist_title)
+
+        playlist_row1 = QHBoxLayout()
+        playlist_row1.setSpacing(8)
+        playlist_row1.addWidget(QLabel("当前歌单:"))
+        self.combo_playlist = QComboBox()
+        self.combo_playlist.setMinimumWidth(160)
+        self.combo_playlist.setToolTip("切换歌单后，当前选中的背景音乐将自动替换为该歌单的曲目")
+        playlist_row1.addWidget(self.combo_playlist, 1)
+        self.btn_playlist_new = QPushButton("＋ 新建歌单")
+        self.btn_playlist_new.setToolTip("将当前选中的背景音乐保存为新歌单")
+        playlist_row1.addWidget(self.btn_playlist_new)
+        self.btn_playlist_save = QPushButton("💾 保存到歌单")
+        self.btn_playlist_save.setToolTip("将当前选中的背景音乐覆盖保存到所选歌单")
+        playlist_row1.addWidget(self.btn_playlist_save)
+        self.btn_playlist_delete = QPushButton("🗑 删除歌单")
+        self.btn_playlist_delete.setToolTip("删除当前所选歌单（不影响音频库）")
+        playlist_row1.addWidget(self.btn_playlist_delete)
+        layout_audio.addLayout(playlist_row1)
+
+        self.lbl_playlist_hint = QLabel("「新建歌单」可将当前选中的音乐保存为歌单，下次直接切换加载")
+        self.lbl_playlist_hint.setStyleSheet("color: #4b5563; font-size: 9pt;")
+        layout_audio.addWidget(self.lbl_playlist_hint)
+
         main_layout.addWidget(self.card_audio)
 
         card_action, layout_action = self.create_card("💾 输出与执行")
@@ -424,8 +477,6 @@ class VideoMergerUI(QWidget):
         self.btn_out_path.clicked.connect(self.select_output_dir)
         self.btn_start.clicked.connect(self.start_merge)
         self.btn_stop.clicked.connect(self.stop_merge)
-        # 去掉声音勾选变化 → 显示/隐藏音乐面板
-        self.check_mute.stateChanged.connect(lambda _: self._toggle_music_panel())
         # 不规则合并模式
         self.check_irregular.stateChanged.connect(lambda _: self._toggle_irregular_mode())
         self.btn_irregular_config.clicked.connect(self._open_irregular_dialog)
@@ -438,6 +489,11 @@ class VideoMergerUI(QWidget):
         self.btn_remove_audio.clicked.connect(self._remove_selected_audio)
         self.btn_clear_audio.clicked.connect(self._clear_audio_library)
         self.audio_select_bar.clicked.connect(self._open_audio_select_dialog)
+        # 歌单管理
+        self.combo_playlist.currentIndexChanged.connect(self._switch_playlist)
+        self.btn_playlist_new.clicked.connect(self._new_playlist)
+        self.btn_playlist_save.clicked.connect(self._save_to_playlist)
+        self.btn_playlist_delete.clicked.connect(self._delete_playlist)
 
     def add_files(self):
         files, _ = QFileDialog.getOpenFileNames(self, "选择视频", "", "Video Files (*.mp4 *.avi *.mov *.mkv)")
@@ -460,8 +516,8 @@ class VideoMergerUI(QWidget):
     # ── 音乐面板显示控制 ───────────────────────────────────────────────────
 
     def _toggle_music_panel(self):
-        """去掉声音勾选时，显示背景音乐面板；否则隐藏。"""
-        self.card_audio.setVisible(self.check_mute.isChecked())
+        """背景音乐面板现在常驻显示，与“去掉声音”解耦；保留此方法以兼容旧调用。"""
+        self.card_audio.setVisible(True)
 
     # ── 不规则合并模式 ────────────────────────────────────────────────────
 
@@ -608,6 +664,100 @@ class VideoMergerUI(QWidget):
             self.audio_select_label.setText(text)
             self.audio_select_label.setStyleSheet("color: #f43f5e; font-size: 10pt; font-weight: bold;")
 
+    # ── 歌单管理 ──────────────────────────────────────────────────────────
+
+    def _refresh_playlist_combo(self):
+        """重新填充歌单下拉框，保持当前选中项（若存在）。"""
+        current = self.combo_playlist.currentText()
+        self.combo_playlist.blockSignals(True)
+        self.combo_playlist.clear()
+        self.combo_playlist.addItem("（未选择歌单）")
+        for name in self.playlists:
+            self.combo_playlist.addItem(name)
+        idx = self.combo_playlist.findText(current)
+        self.combo_playlist.setCurrentIndex(max(0, idx))
+        self.combo_playlist.blockSignals(False)
+        has_pl = bool(self.playlists)
+        self.btn_playlist_save.setEnabled(has_pl)
+        self.btn_playlist_delete.setEnabled(has_pl)
+
+    def _switch_playlist(self, index: int):
+        """切换到所选歌单，将 selected_audios 替换为该歌单的曲目并刷新界面。"""
+        if index <= 0:
+            return
+        name = self.combo_playlist.currentText()
+        if name not in self.playlists:
+            return
+        library_paths = {e['path'] for e in self.audio_library.get_all()}
+        valid = [p for p in self.playlists[name] if p in library_paths]
+        self.selected_audios = valid
+        self._update_audio_select_bar()
+        self.lbl_playlist_hint.setText(
+            f"已切换到歌单「{name}」，共 {len(valid)} 首"
+        )
+
+    def _new_playlist(self):
+        """将当前选中的背景音乐保存为新歌单。"""
+        if not self.selected_audios:
+            QMessageBox.information(self, "提示", "请先在下方选择器中选择背景音乐，再创建歌单。")
+            return
+        name, ok = QInputDialog.getText(self, "新建歌单", "请输入歌单名称：")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if name in self.playlists:
+            reply = QMessageBox.question(
+                self, "歌单已存在",
+                f"歌单「{name}」已存在，是否覆盖保存？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        self.playlists[name] = list(self.selected_audios)
+        self.save_settings()
+        self._refresh_playlist_combo()
+        idx = self.combo_playlist.findText(name)
+        if idx >= 0:
+            self.combo_playlist.blockSignals(True)
+            self.combo_playlist.setCurrentIndex(idx)
+            self.combo_playlist.blockSignals(False)
+        self.lbl_playlist_hint.setText(
+            f"歌单「{name}」已保存，共 {len(self.selected_audios)} 首"
+        )
+
+    def _save_to_playlist(self):
+        """将当前选中的背景音乐覆盖保存到当前所选歌单。"""
+        name = self.combo_playlist.currentText()
+        if not name or name == "（未选择歌单）":
+            QMessageBox.information(self, "提示", "请先在下拉框中选择一个歌单。")
+            return
+        if not self.selected_audios:
+            QMessageBox.information(self, "提示", "当前没有选中任何背景音乐。")
+            return
+        self.playlists[name] = list(self.selected_audios)
+        self.save_settings()
+        self.lbl_playlist_hint.setText(
+            f"已将当前选中的 {len(self.selected_audios)} 首音乐保存到歌单「{name}」"
+        )
+
+    def _delete_playlist(self):
+        """删除当前所选歌单。"""
+        name = self.combo_playlist.currentText()
+        if not name or name == "（未选择歌单）":
+            QMessageBox.information(self, "提示", "请先在下拉框中选择要删除的歌单。")
+            return
+        reply = QMessageBox.question(
+            self, "确认删除",
+            f"确定要删除歌单「{name}」吗？（不影响音频库）",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.playlists.pop(name, None)
+        self.save_settings()
+        self._refresh_playlist_combo()
+        self.lbl_playlist_hint.setText(f"歌单「{name}」已删除")
+
     def _get_audio_for_tasks(self, num_tasks: int) -> list:
         """Return a list of audio_path (or None) for each output video."""
         audios = self.selected_audios
@@ -718,8 +868,8 @@ class VideoMergerUI(QWidget):
 
         if not tasks: return
 
-        # 分配背景音乐（仅当去掉声音 + 勾选添加音乐时）
-        use_music = self.check_mute.isChecked() and self.check_add_music.isChecked()
+        # 分配背景音乐（勾选添加音乐即可，不再要求去掉原声）
+        use_music = self.check_add_music.isChecked()
         if use_music and self.selected_audios:
             audio_assignments = self._get_audio_for_tasks(len(tasks))
         else:
