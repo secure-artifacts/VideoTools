@@ -105,11 +105,11 @@ class FFmpegWorker(QThread):
             output_file = task["output_file"]
             if not task_videos: continue
 
-            # ── Background audio (only when mute=True and task has audio_path) ──
+            # ── Background audio (mute=True: replace original; mute=False+audio: mix with amix) ──
             audio_path: str | None = task.get("audio_path")
             skip_start: float = task.get("audio_skip_start", 0.0)
             fade_in:    float = task.get("audio_fade_in",    0.0)
-            has_bg_audio = self.mute and bool(audio_path and os.path.isfile(audio_path))
+            has_bg_audio = bool(audio_path and os.path.isfile(audio_path))
             
             self.progress.emit(int((i / total_tasks) * 100), f"正在处理第 {i+1}/{total_tasks} 个视频 ({target_w}x{target_h})...")
 
@@ -214,15 +214,28 @@ class FFmpegWorker(QThread):
                     "asetpts=PTS-STARTPTS",
                     "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo",
                 ])
-                filter_complex += f"[{bg_audio_idx}:a]{','.join(a_filters)}[outa]"
+                if self.mute:
+                    # 去掉原声：背景音乐直接作为 [outa]
+                    filter_complex += f"[{bg_audio_idx}:a]{','.join(a_filters)}[outa]"
+                else:
+                    # 保留原声：背景音乐处理后与原声 amix 混合
+                    filter_complex += f"[{bg_audio_idx}:a]{','.join(a_filters)}[bga];"
+                    filter_complex += f"[outa][bga]amix=inputs=2:duration=first:normalize=0[outa]"
 
             cmd = [self.ffmpeg_path, '-y'] + inputs
             if self.mute and has_bg_audio:
+                # 去掉原声 + 背景音乐
                 cmd.extend(['-filter_complex', filter_complex, '-map', '[outv]', '-map', '[outa]',
                              '-c:a', 'aac', '-b:a', self._get_audio_bitrate(audio_path)])
             elif self.mute:
+                # 去掉声音，无背景音乐
                 cmd.extend(['-filter_complex', filter_complex, '-map', '[outv]', '-an'])
+            elif has_bg_audio:
+                # 保留原声 + 背景音乐混音（amix 输出已写入 [outa]）
+                cmd.extend(['-filter_complex', filter_complex, '-map', '[outv]', '-map', '[outa]',
+                             '-c:a', 'aac', '-b:a', self._get_audio_bitrate(audio_path)])
             else:
+                # 保留原声，无背景音乐
                 cmd.extend(['-filter_complex', filter_complex, '-map', '[outv]', '-map', '[outa]'])
 
             cmd.extend(['-c:v', 'libx264', '-crf', '23', '-preset', 'fast', '-aspect', aspect_str, output_file])
