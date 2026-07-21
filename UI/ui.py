@@ -512,6 +512,7 @@ class VideoMergerUI(QWidget):
         if dir_path:
             self.base_dir = dir_path
             self.lbl_out_path.setText(f"已选择: {self.base_dir}")
+            self.settings.setValue("v_base_dir", self.base_dir)  # 立即持久化，重启后自动恢复
 
     # ── 音乐面板显示控制 ───────────────────────────────────────────────────
 
